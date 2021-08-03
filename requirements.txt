@@ -1,0 +1,7 @@
+databind.core==1.1.1
+databind.json==1.1.1
+grayskull==0.8.5
+nr.utils.git==0.4.0
+PyYAML==5.4.1
+requests==2.26.0
+termcolor==1.1.0
