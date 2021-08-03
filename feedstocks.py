@@ -8,6 +8,8 @@ import sys
 import typing as t
 
 import databind.json
+import grayskull
+from grayskull.cli import CLIConfig
 import nr.utils.git
 import requests
 import yaml
@@ -85,7 +87,10 @@ def _do_create(config: Config, package: str, version: str) -> None:
 
   print(colored(f'Creating {package} {version}', 'green'))
   repo.create_branch(f'add-{package}', reset=True, ref='upstream/master')
+  repo.reset('upstream/master', hard=True)
 
+  CLIConfig().stdout = True
+  CLIConfig().list_missing_deps = True
   recipe = GrayskullFactory.create_recipe(
     "pypi",
     package,
@@ -97,7 +102,7 @@ def _do_create(config: Config, package: str, version: str) -> None:
   repo.add([os.path.relpath(output_dir, repo.path)])
   repo.commit(f"Generated recipe for {package}@{version} with grayskull {grayskull_version}.")
   cb = repo.get_current_branch_name()
-  repo.push('origin', f'{cb}:{cb}')
+  repo.push('origin', f'{cb}:{cb}', force=True)
 
 
 def main():
