@@ -3,17 +3,18 @@ import argparse
 import re
 import dataclasses
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import typing as t
 
 import databind.json
-import grayskull
-from grayskull.cli import CLIConfig
 import nr.utils.git
 import requests
 import yaml
 from grayskull import __version__ as grayskull_version
+from grayskull.cli import CLIConfig
 from grayskull.base.factory import GrayskullFactory
 from termcolor import colored
 
@@ -39,6 +40,35 @@ def get_feedstock_meta_yaml(package_name: str) -> t.Optional[str]:
 
 def get_version_from_meta_yaml(meta_yaml: str) -> str:
   return re.search(r'{%\s*set\s+version\s*=\s*"(.*?)"\s*%}', meta_yaml).group(1)
+
+
+def generate_recipe(output_dir: str, package: str, version: str) -> None:
+  CLIConfig().stdout = True
+  CLIConfig().list_missing_deps = True
+  recipe = GrayskullFactory.create_recipe("pypi", package, version)
+  recipe.generate_recipe(output_dir)
+
+
+def generate_recipe_into(output_dir: str, package: str, version: str) -> None:
+  with tempfile.TemporaryDirectory() as tempdir:
+    generate_recipe(tempdir, package, version)
+    shutil.copytree(os.path.join(tempdir, package), output_dir, dirs_exist_ok=True)
+
+
+def ensure_repo_is_cloned(
+  repo: nr.utils.git.Git,
+  clone_url: str,
+  upstream_url: t.Optional[str] = None,
+  after_clone_steps: t.Optional[str] = None,
+) -> None:
+  if os.path.isdir(repo.path):
+    return
+  print(colored(f'Cloning {os.path.basename(repo.path)}/staged-recipes...', 'green'))
+  repo.clone(clone_url)
+  if upstream_url:
+    repo.add_remote('upstream', upstream_url)
+  if after_clone_steps:
+    repo.check_call(['bash', '-c', after_clone_steps])
 
 
 def get_argument_parser() -> argparse.ArgumentParser:
@@ -70,37 +100,39 @@ def _do_create(config: Config, package: str, version: str) -> None:
     sys.exit(1)
 
   repo = nr.utils.git.Git('data/staged-recipes')
-
-  if not os.path.isdir(repo.path):
-    print(colored(f'Cloning {config.github_user}/staged-recipes...', 'green'))
-    clone_url = f'git@github.com:{config.github_user}/staged-recipes'
-    upstream_url = f'https://github.com/conda-forge/staged-recipes.git'
-    try:
-      repo.clone(clone_url)
-    except subprocess.CalledProcessError:
-      print(colored('error: You may need to fork conda-forge/staged-recipes first.', 'red'))
-      sys.exit(1)
-    repo.add_remote('upstream', upstream_url)
-    if config.after_clone:
-      repo.check_call(['bash', '-c', config.after_clone])
+  clone_url = f'git@github.com:{config.github_user}/staged-recipes'
+  upstream_url = f'https://github.com/conda-forge/staged-recipes.git'
+  ensure_repo_is_cloned(repo, clone_url, upstream_url, config.after_clone)
   repo.fetch('upstream')
 
   print(colored(f'Creating {package} {version}', 'green'))
   repo.create_branch(f'add-{package}', reset=True, ref='upstream/master')
   repo.reset('upstream/master', hard=True)
 
-  CLIConfig().stdout = True
-  CLIConfig().list_missing_deps = True
-  recipe = GrayskullFactory.create_recipe(
-    "pypi",
-    package,
-    version)
-
   output_dir = os.path.join(repo.path, 'recipes')
-  recipe.generate_recipe(output_dir)
+  generate_recipe(output_dir, package, version)
 
   repo.add([os.path.relpath(output_dir, repo.path)])
   repo.commit(f"Generated recipe for {package}@{version} with grayskull {grayskull_version}.")
+  cb = repo.get_current_branch_name()
+  repo.push('origin', f'{cb}:{cb}', force=True)
+
+
+def _do_update(config: Config, package: str, version: str) -> None:
+  repo = nr.utils.git.Git(f'data/{package}-feedstock')
+  clone_url = f'git@github.com:{config.github_user}/{package}-feedstock'
+  upstream_url = f'https://github.com/conda-forge/{package}-feedstock'
+  ensure_repo_is_cloned(repo, clone_url, upstream_url, config.after_clone)
+
+  print(f'Creating upgrade PR for {package}@{version}')
+  repo.create_branch(f'upgrade-to-{version}', reset=True, ref='upstream/master')
+  repo.reset('upstream/master', hard=True)
+
+  output_dir = os.path.join(repo.path, 'recipe')
+  generate_recipe_into(output_dir, package, version)
+
+  repo.add([os.path.relpath(output_dir, repo.path)])
+  repo.commit(f"{package}@{version} (grayskull {grayskull_version})")
   cb = repo.get_current_branch_name()
   repo.push('origin', f'{cb}:{cb}', force=True)
 
@@ -122,6 +154,7 @@ def main():
     return
 
   if args.update:
+    _do_update(config, args.update, package_versions[args.update])
     return
 
   parser.print_usage()
