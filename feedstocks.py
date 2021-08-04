@@ -13,6 +13,7 @@ import databind.json
 import github
 import nr.utils.git
 import requests
+import termcolor
 import yaml
 from grayskull import __version__ as grayskull_version
 from grayskull.cli import CLIConfig
@@ -49,6 +50,9 @@ def generate_recipe(output_dir: str, package: str, version: str) -> None:
   CLIConfig().list_missing_deps = True
   recipe = GrayskullFactory.create_recipe("pypi", package, version)
   recipe.generate_recipe(output_dir)
+  CLIConfig().stdout = False
+  CLIConfig().list_missing_deps = False
+  print(termcolor.RESET, end='')
 
 
 def generate_recipe_into(output_dir: str, package: str, version: str) -> None:

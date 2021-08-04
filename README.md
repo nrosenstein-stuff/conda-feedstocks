@@ -27,3 +27,5 @@ __Usage__
     ```sh
     $ python feedstocks.py --update <package_name> --token <github_token>
     ```
+
+The pull requests still need to be created manually afterwards.
