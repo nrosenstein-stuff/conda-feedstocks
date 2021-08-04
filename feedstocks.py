@@ -69,7 +69,6 @@ def ensure_repo_is_cloned(
 ) -> None:
   if os.path.isdir(repo.path):
     return
-  print(colored(f'Cloning {os.path.basename(repo.path)}/staged-recipes...', 'green'))
   repo.clone(clone_url)
   if upstream_url:
     repo.add_remote('upstream', upstream_url)
@@ -90,7 +89,7 @@ def get_argument_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser()
   parser.add_argument('-t', '--token', help='The GitHub token.')
   parser.add_argument('-l', '--list', action='store_true', help='List the latest status of each feedstock.')
-  parser.add_argument('-c', '--create', metavar='feedstock', help='Create a staged feedstock.')
+  parser.add_argument('-c', '--create', metavar='feedstock', nargs='*', help='Create (a) staged recipe(s). Without arguments, all missing recipes will be created.')
   parser.add_argument('-u', '--update', metavar='feedstock', help='Update the recipe for a feedstock.')
   parser.add_argument('--user', help='Name of your GitHub user. The staged-recipes repository must already be forked.')
   return parser
@@ -109,11 +108,12 @@ def _do_list(package_versions: t.Dict[str, str]) -> None:
       print(colored(f'{package} not found', 'red'))
 
 
-def _do_create(config: Config, client: github.Github, package: str, version: str) -> None:
-  meta_yaml = get_feedstock_meta_yaml(package)
-  if meta_yaml:
-    print(colored(f'error: the feedstock for {package} already exists, try using -u,--update', 'red'))
-    sys.exit(1)
+def _do_create(config: Config, client: github.Github, packages_and_versions: t.Dict[str, str]) -> None:
+  for package in packages_and_versions:
+    meta_yaml = get_feedstock_meta_yaml(package)
+    if meta_yaml:
+      print(colored(f'error: the feedstock for {package} already exists, try using -u,--update', 'red'))
+      sys.exit(1)
 
   repo = nr.utils.git.Git('data/staged-recipes')
   clone_url = f'git@github.com:{config.github_user}/staged-recipes'
@@ -122,15 +122,19 @@ def _do_create(config: Config, client: github.Github, package: str, version: str
   ensure_repo_is_cloned(repo, clone_url, upstream_url, config.after_clone)
   repo.fetch('upstream')
 
-  print(colored(f'Creating {package} {version}', 'green'))
-  repo.create_branch(f'add-{package}', reset=True, ref='upstream/master')
+  branch_name = 'add-' + '-'.join(packages_and_versions)
+  if len(branch_name) > 30:
+    branch_name = f'add-{len(packages_and_versions)}-packages'
+  repo.create_branch(branch_name, reset=True, ref='upstream/master')
   repo.reset('upstream/master', hard=True)
 
   output_dir = os.path.join(repo.path, 'recipes')
-  generate_recipe(output_dir, package, version)
+  for package, version in packages_and_versions.items():
+    print(colored(f'Creating {package} {version}', 'green'))
+    generate_recipe(output_dir, package, version)
 
   repo.add([os.path.relpath(output_dir, repo.path)])
-  repo.commit(f"Generated recipe for {package}@{version} with grayskull {grayskull_version}.")
+  repo.commit(f'Add {", ".join(t[0] + "@" + t[1] for t in packages_and_versions)}')
   cb = repo.get_current_branch_name()
   repo.push('origin', f'{cb}:{cb}', force=True)
 
@@ -167,6 +171,11 @@ def main():
     config = databind.json.load(yaml.safe_load(fp), Config)
   package_versions = dict(package.split('@') for package in config.feedstocks)
 
+  if args.create is not None:
+    print('Collecting which feedstocks need to be staged...')
+    args.create = [p for p in package_versions if not get_feedstock_meta_yaml(p)]
+    print('Creating recipes for the following packages:\n  ' + '\n  '.join(args.create))
+
   if args.list:
     _do_list(package_versions)
     return
@@ -177,7 +186,8 @@ def main():
     client = github.Github(args.token)
 
   if args.create:
-    _do_create(config, client, args.create, package_versions[args.create])
+    packages_and_versions = {p: package_versions[p] for p in args.create}
+    _do_create(config, client, packages_and_versions)
     return
 
   if args.update:

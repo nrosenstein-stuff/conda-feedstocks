@@ -19,7 +19,7 @@ __Usage__
 * Fork `conda-forge/staged-recipes` and create a new branch to submit a new recipe via Grayskull:
 
     ```sh
-    $ python feedstocks.py --create <package_name> --token <github_token>
+    $ python feedstocks.py --create <package_name1> <package_name2> --token <github_token>
     ```
 
 * Fork `conda-forge/<package>-feedstock` and create a new branch with an updated recipe and repo files;
@@ -28,4 +28,4 @@ __Usage__
     $ python feedstocks.py --update <package_name> --token <github_token>
     ```
 
-The pull requests still need to be created manually afterwards.
+The pull request needs to be created manually afterwards.
