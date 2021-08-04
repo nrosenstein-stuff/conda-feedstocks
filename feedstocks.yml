@@ -13,6 +13,7 @@ feedstocks:
 - nr.pylang.utils@0.1.3
 - nr.stream@0.1.2
 - nr.utils.re@0.3.1
+- pydoc-markdown@4.1.3
 
 # Deprecated packages
 - nr@2.0.12

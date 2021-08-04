@@ -1,8 +1,9 @@
 
 import argparse
-import re
+import enum
 import dataclasses
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -18,7 +19,7 @@ import yaml
 from grayskull import __version__ as grayskull_version
 from grayskull.cli import CLIConfig
 from grayskull.base.factory import GrayskullFactory
-from termcolor import colored
+from termcolor import cprint
 
 RECIPE_RAW_URL_TEMPLATE = 'https://raw.githubusercontent.com/conda-forge/{package}-feedstock/master/recipe/meta.yaml'
 STAGED_RECIPES_CLONE_URL_TEMPLATE = 'https://github.com/{user}/staged-recipes.git'
@@ -61,106 +62,166 @@ def generate_recipe_into(output_dir: str, package: str, version: str) -> None:
     shutil.copytree(os.path.join(tempdir, package), output_dir, dirs_exist_ok=True)
 
 
-def ensure_repo_is_cloned(
-  repo: nr.utils.git.Git,
-  clone_url: str,
-  upstream_url: t.Optional[str] = None,
-  after_clone_steps: t.Optional[str] = None,
-) -> None:
-  if os.path.isdir(repo.path):
-    return
-  repo.clone(clone_url)
-  if upstream_url:
-    repo.add_remote('upstream', upstream_url)
-  if after_clone_steps:
-    repo.check_call(['bash', '-c', after_clone_steps])
-
-
-def ensure_fork_exists(client: github.Github, original_owner: str, repo: str) -> None:
-  try:
-    client.get_repo(client.get_user().login + '/' + repo)
-  except github.UnknownObjectException:
-    print(colored(f'Forking {original_owner}/{repo}...', 'cyan'))
-    fork = client.get_repo(original_owner + '/' + repo).create_fork()
-    print(fork)
-
-
 def get_argument_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser()
   parser.add_argument('-t', '--token', help='The GitHub token.')
+  parser.add_argument('-b', '--branch', help='The branch name. If not specified, a default branch name will be selected.')
   parser.add_argument('-l', '--list', action='store_true', help='List the latest status of each feedstock.')
   parser.add_argument('-c', '--create', metavar='feedstock', nargs='*', help='Create (a) staged recipe(s). Without arguments, all missing recipes will be created.')
   parser.add_argument('-u', '--update', metavar='feedstock', help='Update the recipe for a feedstock.')
-  parser.add_argument('--user', help='Name of your GitHub user. The staged-recipes repository must already be forked.')
   return parser
 
 
-def _do_list(package_versions: t.Dict[str, str]) -> None:
-  for package, target_version in package_versions.items():
-    meta_yaml = get_feedstock_meta_yaml(package)
-    if meta_yaml:
-      latest_version = get_version_from_meta_yaml(meta_yaml)
-      if latest_version == target_version:
-        print(colored(f'{package} {target_version}', 'green'))
+@dataclasses.dataclass
+class Options:
+
+  class Action(enum.Enum):
+    list = enum.auto()
+    create = enum.auto()
+    update = enum.auto()
+
+  token: t.Optional[str] = None
+  branch: t.Optional[str] = None
+  action: t.Optional[Action] = None
+  create_feedstocks: t.Optional[t.List[str]] = None
+  update_feedstock: t.Optional[str] = None
+
+  @classmethod
+  def from_args(cls, args: argparse.Namespace) -> 'Options':
+    self = cls()
+    self.token = args.token
+    self.branch = args.branch
+    self.create_feedstocks = args.create
+    self.update_feedstock = args.update
+
+    if sum(1 for _ in (args.list, args.create is not None, args.update) if _) > 1:
+      raise ValueError('multiple operations specified')
+    if args.list:
+      self.action = Options.Action.list
+    elif args.create is not None:
+      self.action = Options.Action.create
+    elif args.update:
+      self.action = Options.Action.update
+
+    return self
+
+  def get_github_client(self) -> t.Optional[github.Github]:
+    if self.token:
+      return github.Github(self.token)
+    return None
+
+
+class FeedstocksManager:
+
+  def __init__(self, config: Config, gh: t.Optional[github.Github]) -> None:
+    self._config = config
+    self._gh = gh
+
+  def _get_package_versions(self) -> t.Dict[str, str]:
+    return dict(package.split('@') for package in self._config.feedstocks)
+
+  def _ensure_repo_is_cloned(
+    self,
+    repo: nr.utils.git.Git,
+    clone_url: str,
+    upstream_url: t.Optional[str] = None,
+    after_clone_steps: t.Optional[str] = None,
+  ) -> None:
+    if os.path.isdir(repo.path):
+      return
+    repo.clone(clone_url)
+    if upstream_url:
+      repo.add_remote('upstream', upstream_url)
+    if after_clone_steps:
+      repo.check_call(['bash', '-c', after_clone_steps])
+
+  def _ensure_fork_exists(self, original_owner: str, repo: str) -> None:
+    assert self._gh is not None
+    user_name = self._gh.get_user().login
+    assert user_name == self._config.github_user, 'github user mismatch in config'
+    try:
+      self._gh.get_repo(user_name  + '/' + repo)
+    except github.UnknownObjectException:
+      cprint(f'Forking {original_owner}/{repo}...', 'cyan')
+      self._gh.get_repo(original_owner + '/' + repo).create_fork()
+      # TODO (NiklasRosenstein): Wait for fork to be completed?
+
+  def get_unpublished_packages(self) -> t.List[str]:
+    return [p for p in self._get_package_versions() if not get_feedstock_meta_yaml(p)]
+
+  def list_feedstock_status(self) -> None:
+    package_versions = self._get_package_versions()
+    for package, target_version in package_versions.items():
+      meta_yaml = get_feedstock_meta_yaml(package)
+      if meta_yaml:
+        latest_version = get_version_from_meta_yaml(meta_yaml)
+        if latest_version == target_version:
+          cprint(f'{package} {target_version}', 'green')
+        else:
+          cprint(f'{package} {latest_version} (expected {target_version})', 'yellow')
       else:
-        print(colored(f'{package} {latest_version} (expected {target_version})', 'yellow'))
-    else:
-      print(colored(f'{package} not found', 'red'))
+        cprint(f'{package} not found', 'red')
 
+  def create_feedstocks(self, packages: t.List[str], branch_name: t.Optional[str] = None) -> None:
+    package_versions = self._get_package_versions()
+    package_versions = {p: package_versions[p] for p in packages}
 
-def _do_create(config: Config, client: github.Github, packages_and_versions: t.Dict[str, str]) -> None:
-  for package in packages_and_versions:
-    meta_yaml = get_feedstock_meta_yaml(package)
-    if meta_yaml:
-      print(colored(f'error: the feedstock for {package} already exists, try using -u,--update', 'red'))
-      sys.exit(1)
+    for package in package_versions:
+      meta_yaml = get_feedstock_meta_yaml(package)
+      if meta_yaml:
+        cprint(f'error: the feedstock for {package} already exists, try using -u,--update', 'red')
+        sys.exit(1)
 
-  repo = nr.utils.git.Git('data/staged-recipes')
-  clone_url = f'git@github.com:{config.github_user}/staged-recipes'
-  upstream_url = f'https://github.com/conda-forge/staged-recipes.git'
-  ensure_fork_exists(client, 'conda-forge', 'staged-recipes')
-  ensure_repo_is_cloned(repo, clone_url, upstream_url, config.after_clone)
-  repo.fetch('upstream')
+    repo = nr.utils.git.Git('data/staged-recipes')
+    clone_url = f'git@github.com:{self._config.github_user}/staged-recipes'
+    upstream_url = f'https://github.com/conda-forge/staged-recipes.git'
+    if self._gh:
+      self._ensure_fork_exists('conda-forge', 'staged-recipes')
+    self._ensure_repo_is_cloned(repo, clone_url, upstream_url, self._config.after_clone)
+    repo.fetch('upstream')
 
-  branch_name = 'add-' + '-'.join(packages_and_versions)
-  if len(branch_name) > 30:
-    branch_name = f'add-{len(packages_and_versions)}-packages'
-  repo.create_branch(branch_name, reset=True, ref='upstream/master')
-  repo.reset('upstream/master', hard=True)
+    if not branch_name:
+      branch_name = 'add-' + '-'.join(package_versions)
+      if len(branch_name) > 30:
+        branch_name = f'add-{len(package_versions)}-packages'
+    repo.create_branch(branch_name, reset=True, ref='upstream/master')
+    repo.reset('upstream/master', hard=True)
 
-  output_dir = os.path.join(repo.path, 'recipes')
-  for package, version in packages_and_versions.items():
-    print(colored(f'Creating {package} {version}', 'green'))
-    generate_recipe(output_dir, package, version)
+    output_dir = os.path.join(repo.path, 'recipes')
+    for package, version in package_versions.items():
+      cprint(f'Creating {package} {version}', 'green')
+      generate_recipe(output_dir, package, version)
 
-  repo.add([os.path.relpath(output_dir, repo.path)])
-  repo.commit(f'Add {", ".join(packages_and_versions)}')
-  cb = repo.get_current_branch_name()
-  repo.push('origin', f'{cb}:{cb}', force=True)
+    repo.add([os.path.relpath(output_dir, repo.path)])
+    repo.commit(f'Add {", ".join(package_versions)}')
+    cb = repo.get_current_branch_name()
+    repo.push('origin', f'{cb}:{cb}', force=True)
 
+  def update_feedstock(self, package: str, branch_name: t.Optional[str] = None) -> None:
+    version = self._get_package_versions()[package]
+    repo = nr.utils.git.Git(f'data/{package}-feedstock')
+    clone_url = f'git@github.com:{self._config.github_user}/{package}-feedstock'
+    upstream_url = f'https://github.com/conda-forge/{package}-feedstock'
+    if self._gh:
+      self._ensure_fork_exists('conda-forge', f'{package}-feedstock')
+    self._ensure_repo_is_cloned(repo, clone_url, upstream_url, self._config.after_clone)
+    repo.fetch('upstream')
 
-def _do_update(config: Config, client: github.Github, package: str, version: str) -> None:
-  repo = nr.utils.git.Git(f'data/{package}-feedstock')
-  clone_url = f'git@github.com:{config.github_user}/{package}-feedstock'
-  upstream_url = f'https://github.com/conda-forge/{package}-feedstock'
-  ensure_fork_exists(client, 'conda-forge', f'{package}-feedstock')
-  ensure_repo_is_cloned(repo, clone_url, upstream_url, config.after_clone)
-  repo.fetch('upstream')
+    print(f'Creating upgrade PR for {package}@{version}')
+    branch_name = branch_name or f'upgrade-to-{version}'
+    repo.create_branch(branch_name, reset=True, ref='upstream/master')
+    repo.reset('upstream/master', hard=True)
 
-  print(f'Creating upgrade PR for {package}@{version}')
-  repo.create_branch(f'upgrade-to-{version}', reset=True, ref='upstream/master')
-  repo.reset('upstream/master', hard=True)
+    output_dir = os.path.join(repo.path, 'recipe')
+    generate_recipe_into(output_dir, package, version)
 
-  output_dir = os.path.join(repo.path, 'recipe')
-  generate_recipe_into(output_dir, package, version)
+    conda_bin = os.path.expanduser(self._config.conda_bin) if self._config.conda_bin else 'conda'
+    subprocess.check_call([conda_bin, 'smithy', 'rerender'], cwd=repo.path)
 
-  conda_bin = os.path.expanduser(config.conda_bin) if config.conda_bin else 'conda'
-  subprocess.check_call([conda_bin, 'smithy', 'rerender'], cwd=repo.path)
-
-  repo.add([os.path.relpath(output_dir, repo.path)])
-  repo.commit(f"{package}@{version} (grayskull {grayskull_version})")
-  cb = repo.get_current_branch_name()
-  repo.push('origin', f'{cb}:{cb}', force=True)
+    repo.add([os.path.relpath(output_dir, repo.path)])
+    repo.commit(f"{package}@{version} (grayskull {grayskull_version})")
+    cb = repo.get_current_branch_name()
+    repo.push('origin', f'{cb}:{cb}', force=True)
 
 
 def main():
@@ -169,32 +230,27 @@ def main():
 
   with open('feedstocks.yml') as fp:
     config = databind.json.load(yaml.safe_load(fp), Config)
-  package_versions = dict(package.split('@') for package in config.feedstocks)
 
-  if args.create is not None:
-    print('Collecting which feedstocks need to be staged...')
-    args.create = [p for p in package_versions if not get_feedstock_meta_yaml(p)]
-    print('Creating recipes for the following packages:\n  ' + '\n  '.join(args.create))
-
-  if args.list:
-    _do_list(package_versions)
+  options = Options.from_args(args)
+  if not options.action:
+    parser.print_usage()
     return
 
-  if (args.create or args.update) and not args.token:
-    parser.error('-t,--token is required')
-  if args.create or args.update:
-    client = github.Github(args.token)
-
-  if args.create:
-    packages_and_versions = {p: package_versions[p] for p in args.create}
-    _do_create(config, client, packages_and_versions)
-    return
-
-  if args.update:
-    _do_update(config, client, args.update, package_versions[args.update])
-    return
-
-  parser.print_usage()
+  manager = FeedstocksManager(config, options.get_github_client())
+  if options.action == Options.Action.list:
+    manager.list_feedstock_status()
+  elif options.action == Options.Action.create:
+    assert options.create_feedstocks is not None
+    if not options.create_feedstocks:
+      options.create_feedstocks = manager.get_unpublished_packages()
+    cprint(f'Creating staged recipe for {len(options.create_feedstocks)} packages.: '
+      f'{", ".join(options.create_feedstocks)}', 'cyan')
+    manager.create_feedstocks(options.create_feedstocks, options.branch)
+  elif options.action == Options.Action.update:
+    assert options.update_feedstock
+    manager.update_feedstock(options.update_feedstock, options.branch)
+  else:
+    parser.error('something unexpected happened')
 
 
 if __name__ == '__main__':
