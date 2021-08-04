@@ -134,7 +134,7 @@ def _do_create(config: Config, client: github.Github, packages_and_versions: t.D
     generate_recipe(output_dir, package, version)
 
   repo.add([os.path.relpath(output_dir, repo.path)])
-  repo.commit(f'Add {", ".join(t[0] + "@" + t[1] for t in packages_and_versions)}')
+  repo.commit(f'Add {", ".join(packages_and_versions)}')
   cb = repo.get_current_branch_name()
   repo.push('origin', f'{cb}:{cb}', force=True)
 
