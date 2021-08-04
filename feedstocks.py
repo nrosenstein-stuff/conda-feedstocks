@@ -10,6 +10,7 @@ import tempfile
 import typing as t
 
 import databind.json
+import github
 import nr.utils.git
 import requests
 import yaml
@@ -26,6 +27,7 @@ STAGED_RECIPES_CLONE_URL_TEMPLATE = 'https://github.com/{user}/staged-recipes.gi
 class Config:
   github_user: str
   feedstocks: t.List[str]
+  conda_bin: t.Optional[str] = None
   after_clone: t.Optional[str] = None
 
 
@@ -71,8 +73,18 @@ def ensure_repo_is_cloned(
     repo.check_call(['bash', '-c', after_clone_steps])
 
 
+def ensure_fork_exists(client: github.Github, original_owner: str, repo: str) -> None:
+  try:
+    client.get_repo(client.get_user().login + '/' + repo)
+  except github.UnknownObjectException:
+    print(colored(f'Forking {original_owner}/{repo}...', 'cyan'))
+    fork = client.get_repo(original_owner + '/' + repo).create_fork()
+    print(fork)
+
+
 def get_argument_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser()
+  parser.add_argument('-t', '--token', help='The GitHub token.')
   parser.add_argument('-l', '--list', action='store_true', help='List the latest status of each feedstock.')
   parser.add_argument('-c', '--create', metavar='feedstock', help='Create a staged feedstock.')
   parser.add_argument('-u', '--update', metavar='feedstock', help='Update the recipe for a feedstock.')
@@ -93,7 +105,7 @@ def _do_list(package_versions: t.Dict[str, str]) -> None:
       print(colored(f'{package} not found', 'red'))
 
 
-def _do_create(config: Config, package: str, version: str) -> None:
+def _do_create(config: Config, client: github.Github, package: str, version: str) -> None:
   meta_yaml = get_feedstock_meta_yaml(package)
   if meta_yaml:
     print(colored(f'error: the feedstock for {package} already exists, try using -u,--update', 'red'))
@@ -102,6 +114,7 @@ def _do_create(config: Config, package: str, version: str) -> None:
   repo = nr.utils.git.Git('data/staged-recipes')
   clone_url = f'git@github.com:{config.github_user}/staged-recipes'
   upstream_url = f'https://github.com/conda-forge/staged-recipes.git'
+  ensure_fork_exists(client, 'conda-forge', 'staged-recipes')
   ensure_repo_is_cloned(repo, clone_url, upstream_url, config.after_clone)
   repo.fetch('upstream')
 
@@ -118,11 +131,13 @@ def _do_create(config: Config, package: str, version: str) -> None:
   repo.push('origin', f'{cb}:{cb}', force=True)
 
 
-def _do_update(config: Config, package: str, version: str) -> None:
+def _do_update(config: Config, client: github.Github, package: str, version: str) -> None:
   repo = nr.utils.git.Git(f'data/{package}-feedstock')
   clone_url = f'git@github.com:{config.github_user}/{package}-feedstock'
   upstream_url = f'https://github.com/conda-forge/{package}-feedstock'
+  ensure_fork_exists(client, 'conda-forge', f'{package}-feedstock')
   ensure_repo_is_cloned(repo, clone_url, upstream_url, config.after_clone)
+  repo.fetch('upstream')
 
   print(f'Creating upgrade PR for {package}@{version}')
   repo.create_branch(f'upgrade-to-{version}', reset=True, ref='upstream/master')
@@ -130,6 +145,9 @@ def _do_update(config: Config, package: str, version: str) -> None:
 
   output_dir = os.path.join(repo.path, 'recipe')
   generate_recipe_into(output_dir, package, version)
+
+  conda_bin = os.path.expanduser(config.conda_bin) if config.conda_bin else 'conda'
+  subprocess.check_call([conda_bin, 'smithy', 'rerender'], cwd=repo.path)
 
   repo.add([os.path.relpath(output_dir, repo.path)])
   repo.commit(f"{package}@{version} (grayskull {grayskull_version})")
@@ -149,12 +167,17 @@ def main():
     _do_list(package_versions)
     return
 
+  if (args.create or args.update) and not args.token:
+    parser.error('-t,--token is required')
+  if args.create or args.update:
+    client = github.Github(args.token)
+
   if args.create:
-    _do_create(config, args.create, package_versions[args.create])
+    _do_create(config, client, args.create, package_versions[args.create])
     return
 
   if args.update:
-    _do_update(config, args.update, package_versions[args.update])
+    _do_update(config, client, args.update, package_versions[args.update])
     return
 
   parser.print_usage()
