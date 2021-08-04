@@ -12,6 +12,7 @@ import typing as t
 
 import databind.json
 import github
+from grayskull.base.base_recipe import AbstractRecipeModel
 import nr.utils.git
 import requests
 import termcolor
@@ -46,19 +47,32 @@ def get_version_from_meta_yaml(meta_yaml: str) -> str:
   return re.search(r'{%\s*set\s+version\s*=\s*"(.*?)"\s*%}', meta_yaml).group(1)
 
 
-def generate_recipe(output_dir: str, package: str, version: str) -> None:
+def generate_recipe(
+  output_dir: str,
+  package: str,
+  version: str,
+  process_recipe: t.Optional[t.Callable[[AbstractRecipeModel], t.Any]] = None,
+) -> None:
   CLIConfig().stdout = True
   CLIConfig().list_missing_deps = True
   recipe = GrayskullFactory.create_recipe("pypi", package, version)
+  if process_recipe:
+    process_recipe(recipe)
   recipe.generate_recipe(output_dir)
   CLIConfig().stdout = False
   CLIConfig().list_missing_deps = False
   print(termcolor.RESET, end='')
 
 
-def generate_recipe_into(output_dir: str, package: str, version: str) -> None:
+def generate_recipe_into(
+  output_dir: str,
+  package: str,
+  version: str,
+  process_recipe: t.Optional[t.Callable[[AbstractRecipeModel], t.Any]] = None,
+) -> None:
   with tempfile.TemporaryDirectory() as tempdir:
-    generate_recipe(tempdir, package, version)
+    generate_recipe(tempdir, package, version, process_recipe)
+    # TODO (NiklasRosenstein): Might need to read recipe name after processing.
     shutil.copytree(os.path.join(tempdir, package), output_dir, dirs_exist_ok=True)
 
 
@@ -69,6 +83,8 @@ def get_argument_parser() -> argparse.ArgumentParser:
   parser.add_argument('-l', '--list', action='store_true', help='List the latest status of each feedstock.')
   parser.add_argument('-c', '--create', metavar='feedstock', nargs='*', help='Create (a) staged recipe(s). Without arguments, all missing recipes will be created.')
   parser.add_argument('-u', '--update', metavar='feedstock', help='Update the recipe for a feedstock.')
+  parser.add_argument('-g', '--generate', help='Generate the recipe for all unpublished repositories into the specified directory.')
+  parser.add_argument('-p', '--prefix', help='Prefix recipes with the specified name.')
   return parser
 
 
@@ -79,12 +95,14 @@ class Options:
     list = enum.auto()
     create = enum.auto()
     update = enum.auto()
+    generate = enum.auto()
 
   token: t.Optional[str] = None
   branch: t.Optional[str] = None
   action: t.Optional[Action] = None
   create_feedstocks: t.Optional[t.List[str]] = None
   update_feedstock: t.Optional[str] = None
+  generate_dir: t.Optional[str] = None
 
   @classmethod
   def from_args(cls, args: argparse.Namespace) -> 'Options':
@@ -93,6 +111,7 @@ class Options:
     self.branch = args.branch
     self.create_feedstocks = args.create
     self.update_feedstock = args.update
+    self.generate_dir = args.generate
 
     if sum(1 for _ in (args.list, args.create is not None, args.update) if _) > 1:
       raise ValueError('multiple operations specified')
@@ -102,6 +121,8 @@ class Options:
       self.action = Options.Action.create
     elif args.update:
       self.action = Options.Action.update
+    elif args.generate:
+      self.action = Options.Action.generate
 
     return self
 
@@ -113,9 +134,10 @@ class Options:
 
 class FeedstocksManager:
 
-  def __init__(self, config: Config, gh: t.Optional[github.Github]) -> None:
+  def __init__(self, config: Config, gh: t.Optional[github.Github], prefix: t.Optional[str] = None) -> None:
     self._config = config
     self._gh = gh
+    self._prefix = prefix
 
   def _get_package_versions(self) -> t.Dict[str, str]:
     return dict(package.split('@') for package in self._config.feedstocks)
@@ -190,7 +212,7 @@ class FeedstocksManager:
     output_dir = os.path.join(repo.path, 'recipes')
     for package, version in package_versions.items():
       cprint(f'Creating {package} {version}', 'green')
-      generate_recipe(output_dir, package, version)
+      generate_recipe(output_dir, package, version, self._process_recipe)
 
     repo.add([os.path.relpath(output_dir, repo.path)])
     repo.commit(f'Add {", ".join(package_versions)}')
@@ -213,7 +235,7 @@ class FeedstocksManager:
     repo.reset('upstream/master', hard=True)
 
     output_dir = os.path.join(repo.path, 'recipe')
-    generate_recipe_into(output_dir, package, version)
+    generate_recipe_into(output_dir, package, version, self._process_recipe)
 
     conda_bin = os.path.expanduser(self._config.conda_bin) if self._config.conda_bin else 'conda'
     subprocess.check_call([conda_bin, 'smithy', 'rerender'], cwd=repo.path)
@@ -222,6 +244,26 @@ class FeedstocksManager:
     repo.commit(f"{package}@{version} (grayskull {grayskull_version})")
     cb = repo.get_current_branch_name()
     repo.push('origin', f'{cb}:{cb}', force=True)
+
+  def generate_recipes(self, recipes_dir: str) -> None:
+    package_versions = self._get_package_versions()
+    os.makedirs(recipes_dir, exist_ok=True)
+    for package in self.get_unpublished_packages():
+      generate_recipe(recipes_dir, package, package_versions[package], self._process_recipe)
+
+  def _process_recipe(self, recipe: AbstractRecipeModel) -> None:
+    if not self._prefix:
+      return
+
+    # Add the prefix to the recipe name and to requirements known to the feedstock manager.
+    packages = set(self._get_package_versions())
+    name = recipe['package']['name'].values[0]
+    recipe.set_var_content(name, self._prefix + recipe.get_var_content(name))
+    for section in recipe['requirements']:
+      for idx, item in enumerate(section):
+        package_name = re.split(r'[\s<>=!]', item.value)[0]
+        if package_name in packages:
+          item.value = self._prefix + item.value
 
 
 def main():
@@ -236,7 +278,7 @@ def main():
     parser.print_usage()
     return
 
-  manager = FeedstocksManager(config, options.get_github_client())
+  manager = FeedstocksManager(config, options.get_github_client(), args.prefix)
   if options.action == Options.Action.list:
     manager.list_feedstock_status()
   elif options.action == Options.Action.create:
@@ -249,6 +291,9 @@ def main():
   elif options.action == Options.Action.update:
     assert options.update_feedstock
     manager.update_feedstock(options.update_feedstock, options.branch)
+  elif options.action == Options.Action.generate:
+    assert options.generate_dir
+    manager.generate_recipes(options.generate_dir)
   else:
     parser.error('something unexpected happened')
 
