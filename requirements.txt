@@ -1,6 +1,8 @@
 databind.core==1.1.1
 databind.json==1.1.1
 grayskull==0.8.5
+jinja2==3.0.1
+networkx==2.6.2
 nr.utils.git==0.4.0
 PyGithub==2.0.3
 PyYAML==5.4.1

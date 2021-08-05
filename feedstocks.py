@@ -3,23 +3,28 @@ import argparse
 import enum
 import dataclasses
 import os
+import posixpath
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import typing as t
+from pathlib import Path
 
 import databind.json
 import github
-from grayskull.base.base_recipe import AbstractRecipeModel
+import jinja2
+import networkx
 import nr.utils.git
 import requests
 import termcolor
 import yaml
 from grayskull import __version__ as grayskull_version
+from grayskull.base.base_recipe import AbstractRecipeModel
 from grayskull.cli import CLIConfig
 from grayskull.base.factory import GrayskullFactory
+from grayskull.pypi import PyPi
 from termcolor import cprint
 
 RECIPE_RAW_URL_TEMPLATE = 'https://raw.githubusercontent.com/conda-forge/{package}-feedstock/master/recipe/meta.yaml'
@@ -32,6 +37,9 @@ class Config:
   feedstocks: t.List[str]
   conda_bin: t.Optional[str] = None
   after_clone: t.Optional[str] = None
+
+  def get_conda_bin(self) -> str:
+    return os.path.expanduser(self.conda_bin) if self.conda_bin else 'conda'
 
 
 def get_feedstock_meta_yaml(package_name: str) -> t.Optional[str]:
@@ -70,21 +78,34 @@ def generate_recipe_into(
   version: str,
   process_recipe: t.Optional[t.Callable[[AbstractRecipeModel], t.Any]] = None,
 ) -> None:
+
+  # Capture the package name if it is changed in *process_recipe*.
+  def _processor(recipe: AbstractRecipeModel) -> None:
+    nonlocal package
+    if process_recipe:
+      process_recipe(recipe)
+      package = recipe.get_var_content(recipe['package']['name'].values[0])
+
   with tempfile.TemporaryDirectory() as tempdir:
-    generate_recipe(tempdir, package, version, process_recipe)
-    # TODO (NiklasRosenstein): Might need to read recipe name after processing.
+    generate_recipe(tempdir, package, version, _processor)
     shutil.copytree(os.path.join(tempdir, package), output_dir, dirs_exist_ok=True)
 
 
 def get_argument_parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser()
+  parser.add_argument('packages', nargs='*', help='A list of packages for the current action.')
   parser.add_argument('-t', '--token', help='The GitHub token.')
   parser.add_argument('-b', '--branch', help='The branch name. If not specified, a default branch name will be selected.')
   parser.add_argument('-l', '--list', action='store_true', help='List the latest status of each feedstock.')
-  parser.add_argument('-c', '--create', metavar='feedstock', nargs='*', help='Create (a) staged recipe(s). Without arguments, all missing recipes will be created.')
-  parser.add_argument('-u', '--update', metavar='feedstock', help='Update the recipe for a feedstock.')
-  parser.add_argument('-g', '--generate', help='Generate the recipe for all unpublished repositories into the specified directory.')
-  parser.add_argument('-p', '--prefix', help='Prefix recipes with the specified name.')
+  parser.add_argument('-c', '--create', action='store_true', help='Create staged recipes.')
+  parser.add_argument('-u', '--update', action='store_true', help='Update the recipe for a feedstock.')
+  parser.add_argument('--prefix', help='Add a prefix to generated recipes and requirements known to the feedstock manager.')
+  parser.add_argument('--generate', help='Generate the recipe for the specified packages (or all unpublished packages).')
+  # TODO (NiklasRosenstein): Option(s) to include/exclude packages not for generating but for prefixing in requirements.
+  parser.add_argument('--build', default=NotImplemented, nargs='?', help='Build recipes from the specified directory (or the same directory as --generate).')
+  parser.add_argument('--build-channel', action='append', help='Add conda channels for building.')
+  parser.add_argument('--publish', default=NotImplemented, nargs='?', help='Publish built packages from the specified directory (or the same directory as --generate/--build)')
+  parser.add_argument('--to', help='Publish built packages to the specified repository URL.')
   return parser
 
 
@@ -92,37 +113,45 @@ def get_argument_parser() -> argparse.ArgumentParser:
 class Options:
 
   class Action(enum.Enum):
-    list = enum.auto()
-    create = enum.auto()
-    update = enum.auto()
-    generate = enum.auto()
+    LIST = enum.auto()
+    CREATE = enum.auto()
+    UPDATE = enum.auto()
+    BUILD_AND_STUFF = enum.auto()
 
   token: t.Optional[str] = None
   branch: t.Optional[str] = None
   action: t.Optional[Action] = None
-  create_feedstocks: t.Optional[t.List[str]] = None
-  update_feedstock: t.Optional[str] = None
+  packages: t.List[str] = dataclasses.field(default_factory=list)
+  prefix: t.Optional[str] = None
+  build_channels: t.List[str] = dataclasses.field(default_factory=list)
   generate_dir: t.Optional[str] = None
+  build_from_dir: t.Optional[str] = None
+  publish_from_dir: t.Optional[str] = None
+  publish_to: t.Optional[str] = None
 
   @classmethod
   def from_args(cls, args: argparse.Namespace) -> 'Options':
     self = cls()
     self.token = args.token
     self.branch = args.branch
-    self.create_feedstocks = args.create
-    self.update_feedstock = args.update
-    self.generate_dir = args.generate
+    self.packages = args.packages
+    self.build = args.build
+    self.build_channels = args.build_channel or []
 
-    if sum(1 for _ in (args.list, args.create is not None, args.update) if _) > 1:
+    if sum(1 for _ in (args.list, args.create, args.update, args.generate) if _) > 1:
       raise ValueError('multiple operations specified')
     if args.list:
-      self.action = Options.Action.list
-    elif args.create is not None:
-      self.action = Options.Action.create
+      self.action = Options.Action.LIST
+    elif args.create:
+      self.action = Options.Action.CREATE
     elif args.update:
-      self.action = Options.Action.update
-    elif args.generate:
-      self.action = Options.Action.generate
+      self.action = Options.Action.UPDATE
+    elif args.generate or args.build or args.publish:
+      self.generate_dir = args.generate
+      self.build_from_dir = None if args.build is NotImplemented else (args.build or self.generate_dir)
+      self.publish_from_dir = None if args.publish is NotImplemented else (args.publish or self.build_from_dir)
+      self.publish_to = args.to
+      self.action = Options.Action.BUILD_AND_STUFF
 
     return self
 
@@ -237,30 +266,31 @@ class FeedstocksManager:
     output_dir = os.path.join(repo.path, 'recipe')
     generate_recipe_into(output_dir, package, version, self._process_recipe)
 
-    conda_bin = os.path.expanduser(self._config.conda_bin) if self._config.conda_bin else 'conda'
-    subprocess.check_call([conda_bin, 'smithy', 'rerender'], cwd=repo.path)
+    subprocess.check_call([self._config.get_conda_bin(), 'smithy', 'rerender'], cwd=repo.path)
 
     repo.add([os.path.relpath(output_dir, repo.path)])
     repo.commit(f"{package}@{version} (grayskull {grayskull_version})")
     cb = repo.get_current_branch_name()
     repo.push('origin', f'{cb}:{cb}', force=True)
 
-  def generate_recipes(self, recipes_dir: str) -> None:
+  def generate_recipes(self, recipes_dir: str, packages: t.List[str]) -> None:
     package_versions = self._get_package_versions()
     os.makedirs(recipes_dir, exist_ok=True)
-    for package in self.get_unpublished_packages():
-      generate_recipe(recipes_dir, package, package_versions[package], self._process_recipe)
+    for package in packages:
+      parent_dir = os.path.join(recipes_dir, (self._prefix or '') + package)
+      generate_recipe_into(parent_dir, package, package_versions[package], lambda r: self._process_recipe(r, packages))
 
-  def _process_recipe(self, recipe: AbstractRecipeModel) -> None:
+  def _process_recipe(self, recipe: AbstractRecipeModel, known_packages: t.Optional[t.Sequence[str]] = None) -> None:
     if not self._prefix:
       return
+    packages = set(known_packages if known_packages is not None else self._get_package_versions())
 
     # Add the prefix to the recipe name and to requirements known to the feedstock manager.
-    packages = set(self._get_package_versions())
+    # NOTE: We could set the "name" variable, but it would impact also the PyPI source URL.
     name = recipe['package']['name'].values[0]
-    recipe.set_var_content(name, self._prefix + recipe.get_var_content(name))
+    name.value = self._prefix + recipe.get_var_content(name)
     for section in recipe['requirements']:
-      for idx, item in enumerate(section):
+      for item in section:
         package_name = re.split(r'[\s<>=!]', item.value)[0]
         if package_name in packages:
           item.value = self._prefix + item.value
@@ -279,21 +309,69 @@ def main():
     return
 
   manager = FeedstocksManager(config, options.get_github_client(), args.prefix)
-  if options.action == Options.Action.list:
+
+  if options.action == Options.Action.LIST:
     manager.list_feedstock_status()
-  elif options.action == Options.Action.create:
-    assert options.create_feedstocks is not None
-    if not options.create_feedstocks:
-      options.create_feedstocks = manager.get_unpublished_packages()
-    cprint(f'Creating staged recipe for {len(options.create_feedstocks)} packages.: '
-      f'{", ".join(options.create_feedstocks)}', 'cyan')
-    manager.create_feedstocks(options.create_feedstocks, options.branch)
-  elif options.action == Options.Action.update:
-    assert options.update_feedstock
-    manager.update_feedstock(options.update_feedstock, options.branch)
-  elif options.action == Options.Action.generate:
-    assert options.generate_dir
-    manager.generate_recipes(options.generate_dir)
+
+  elif options.action == Options.Action.CREATE:
+    assert options.packages is not None
+    if not options.packages:
+      options.packages = manager.get_unpublished_packages()
+    cprint(f'Creating staged recipes for {len(options.packages)} packages: f{", ".join(options.packages)}')
+    manager.create_feedstocks(options.packages, options.branch)
+
+  elif options.action == Options.Action.UPDATE:
+    assert len(options.packages) == 1, len(options.packages)
+    manager.update_feedstock(options.packages[0], options.branch)
+
+  elif options.action == Options.Action.BUILD_AND_STUFF:
+    if options.generate_dir:
+      cprint(f'Generating recipes into {options.generate_dir}', 'magenta')
+      if not options.packages:
+        options.packages = manager.get_unpublished_packages()
+      cprint(f'  {len(options.packages)} packages: f{", ".join(options.packages)}')
+      manager.generate_recipes(options.generate_dir, options.packages)
+
+    if options.build_from_dir:
+      cprint(f'Building recipes in {options.build_from_dir}', 'magenta')
+      build_dir = os.path.join(options.build_from_dir, 'build')
+
+      packages: t.Dict[str, t.Dict[str, t.Any]] = {}
+      for directory in os.listdir(options.build_from_dir):
+        if directory == 'build': continue
+        with open(os.path.join(options.build_from_dir, directory, 'meta.yaml')) as fp:
+          out = jinja2.Environment().from_string(fp.read()).render()
+          packages[directory] = yaml.safe_load(out)
+
+      # Sort packages topologically.
+      graph = networkx.DiGraph()
+      graph.add_nodes_from(packages)
+      for package, meta in packages.items():
+        for section in meta['requirements']:
+          for dep in meta['requirements'][section]:
+            package_name = re.split(r'[\s<>=!]', dep)[0]
+            if package_name in packages:
+              graph.add_edge(package_name, package)
+
+      add_args = []
+      for channel in options.build_channels:
+        add_args += ['-c', channel]
+      for package in networkx.algorithms.topological_sort(graph):
+        recipe_dir = os.path.join(options.build_from_dir, package)
+        subprocess.check_call([config.get_conda_bin(), 'build', recipe_dir, '--output-folder', build_dir] + add_args)
+
+    if options.publish_from_dir:
+      cprint(f'Publishing built packages from {options.publish_from_dir}/build', 'magenta')
+      build_dir = Path(options.publish_from_dir) / 'build'
+      for channel in build_dir.iterdir():
+        if not channel.is_dir(): continue
+        for file_ in channel.iterdir():
+          if not file_.name.endswith('.tar.bz2'): continue
+          cprint(f'> {file_}', 'cyan')
+          with file_.open('rb') as fp:
+            url = posixpath.join(options.publish_to, channel.name, file_.name)
+            requests.put(url, data=fp).raise_for_status()
+
   else:
     parser.error('something unexpected happened')
 
