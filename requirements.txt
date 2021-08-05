@@ -4,7 +4,7 @@ grayskull==0.8.5
 jinja2==3.0.1
 networkx==2.6.2
 nr.utils.git==0.4.0
-PyGithub==2.0.3
+PyGithub==1.55
 PyYAML==5.4.1
 requests==2.26.0
 termcolor==1.1.0
