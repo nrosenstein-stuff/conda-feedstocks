@@ -104,6 +104,7 @@ def get_argument_parser() -> argparse.ArgumentParser:
   # TODO (NiklasRosenstein): Option(s) to include/exclude packages not for generating but for prefixing in requirements.
   parser.add_argument('--build', default=NotImplemented, nargs='?', help='Build recipes from the specified directory (or the same directory as --generate).')
   parser.add_argument('--build-channel', action='append', help='Add conda channels for building.')
+  parser.add_argument('--no-test', action='store_true', help='Dont test packages after build.')
   parser.add_argument('--publish', default=NotImplemented, nargs='?', help='Publish built packages from the specified directory (or the same directory as --generate/--build)')
   parser.add_argument('--to', help='Publish built packages to the specified repository URL.')
   return parser
@@ -128,6 +129,7 @@ class Options:
   build_from_dir: t.Optional[str] = None
   publish_from_dir: t.Optional[str] = None
   publish_to: t.Optional[str] = None
+  no_test: bool = False
 
   @classmethod
   def from_args(cls, args: argparse.Namespace) -> 'Options':
@@ -137,6 +139,7 @@ class Options:
     self.packages = args.packages
     self.build = args.build
     self.build_channels = args.build_channel or []
+    self.no_test = args.no_test
 
     if sum(1 for _ in (args.list, args.create, args.update, args.generate) if _) > 1:
       raise ValueError('multiple operations specified')
@@ -356,6 +359,8 @@ def main():
       add_args = []
       for channel in options.build_channels:
         add_args += ['-c', channel]
+      if options.no_test:
+        add_args += ['--no-test']
       for package in networkx.algorithms.topological_sort(graph):
         recipe_dir = os.path.join(options.build_from_dir, package)
         subprocess.check_call([config.get_conda_bin(), 'build', recipe_dir, '--output-folder', build_dir] + add_args)
