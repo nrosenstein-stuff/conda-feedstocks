@@ -24,7 +24,7 @@ from grayskull import __version__ as grayskull_version
 from grayskull.base.base_recipe import AbstractRecipeModel
 from grayskull.cli import CLIConfig
 from grayskull.base.factory import GrayskullFactory
-from grayskull.pypi import PyPi
+from nr.stream import Stream
 from termcolor import cprint
 
 RECIPE_RAW_URL_TEMPLATE = 'https://raw.githubusercontent.com/conda-forge/{package}-feedstock/master/recipe/meta.yaml'
@@ -54,6 +54,14 @@ def get_feedstock_meta_yaml(package_name: str) -> t.Optional[str]:
 
 def get_version_from_meta_yaml(meta_yaml: str) -> str:
   return re.search(r'{%\s*set\s+version\s*=\s*"(.*?)"\s*%}', meta_yaml).group(1)
+
+
+def parse_meta_yaml(meta_yaml: str) -> str:
+  return yaml.safe_load(jinja2.Environment().from_string(meta_yaml).render())
+
+
+def get_package_name_from_version_selector(spec: str) -> str:
+  return re.split(r'[\s<>=!]', spec)[0]
 
 
 def generate_recipe(
@@ -217,13 +225,35 @@ class FeedstocksManager:
     as the repodata could be affected by CDN lags.
     """
 
-    missing: t.List[str] = []
+    cprint('Collecting feedstocks that seem like they can be kicked...', 'cyan')
+
+    missing: t.Dict[str, t.Set[str]] = {}
     for package, version in self._get_package_versions().items():
+      meta_yaml = get_feedstock_meta_yaml(package)
+      if not meta_yaml:
+        cprint(f'  Skipping {package} (feedstock missing)', 'yellow')
+        continue
+      recipe_version = get_version_from_meta_yaml(meta_yaml)
+      if recipe_version != version:
+        cprint(f'  Skipping {package} (feedstock not up to date)', 'yellow')
+        continue
       url = f'https://anaconda.org/conda-forge/{package}/files'
       html = requests.get(url).text
-      if f'{package}-{version}' not in html:
-        missing.append(package)
-    return missing
+      if f'{package}-{version}' in html:
+        cprint(f'  Skipping {package} (exists)', 'green')
+        continue
+      recipe = parse_meta_yaml(meta_yaml)
+      requirements = Stream(recipe['requirements'].values()).concat().map(get_package_name_from_version_selector).collect()
+      missing[package] = requirements
+
+    # Remove packages that depend on other kickable packages.
+    for package in list(missing):
+      if any(p in missing for p in missing[package]):
+        cprint(f'  Skipping {package} (depends on another kickable package)', 'magenta')
+        del missing[package]
+        continue
+
+    return list (missing)
 
   def list_feedstock_status(self) -> None:
     package_versions = self._get_package_versions()
@@ -325,7 +355,7 @@ class FeedstocksManager:
     name.value = self._prefix + recipe.get_var_content(name)
     for section in recipe['requirements']:
       for item in section:
-        package_name = re.split(r'[\s<>=!]', item.value)[0]
+        package_name = get_package_name_from_version_selector(item.value[0])[0]
         if package_name in packages:
           item.value = self._prefix + item.value
 
@@ -384,8 +414,7 @@ def main():
       for directory in os.listdir(options.build_from_dir):
         if directory == 'build': continue
         with open(os.path.join(options.build_from_dir, directory, 'meta.yaml')) as fp:
-          out = jinja2.Environment().from_string(fp.read()).render()
-          packages[directory] = yaml.safe_load(out)
+          packages[directory] = parse_meta_yaml(fp.read())
 
       # Sort packages topologically.
       graph = networkx.DiGraph()
@@ -393,7 +422,7 @@ def main():
       for package, meta in packages.items():
         for section in meta['requirements']:
           for dep in meta['requirements'][section]:
-            package_name = re.split(r'[\s<>=!]', dep)[0]
+            package_name = get_package_name_from_version_selector(dep)[0]
             if package_name in packages:
               graph.add_edge(package_name, package)
 
@@ -421,7 +450,7 @@ def main():
   elif options.action == Options.Action.KICK:
     if not options.packages:
       options.packages = manager.get_kickable_feedstocks()
-    cprint(f'Kicking {len(options.packages)} package(s): {options.packages}')
+    cprint(f'Kicking {len(options.packages)} package(s): {options.packages}', 'cyan')
     manager.kick_feedstocks(options.packages)
 
   else:
