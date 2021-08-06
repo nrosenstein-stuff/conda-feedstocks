@@ -17,6 +17,9 @@ feedstocks:
 
 # Deprecated packages
 - nr@2.0.12
+- nr.bundler@1.2.2
 - nr.cli@1.2.1
+- nr.config@1.2.2
 - nr.date@1.1.0
+- nr.parse@1.1.0
 - nr.types@3.1.1
