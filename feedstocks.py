@@ -247,13 +247,15 @@ class FeedstocksManager:
       missing[package] = requirements
 
     # Remove packages that depend on other kickable packages.
-    for package in list(missing):
-      if any(p in missing for p in missing[package]):
-        cprint(f'  Skipping {package} (depends on another kickable package)', 'magenta')
-        del missing[package]
+    skip: t.Set[str] = set()
+    for package, requirements in missing.items():
+      depends_on_kickables = [p for p in requirements if p in missing]
+      if depends_on_kickables:
+        cprint(f'  Skipping {package} (depends on another kickable package(s): {depends_on_kickables})', 'magenta')
+        skip.add(package)
         continue
 
-    return list (missing)
+    return list(missing.keys() - skip)
 
   def list_feedstock_status(self) -> None:
     package_versions = self._get_package_versions()
