@@ -107,6 +107,7 @@ def get_argument_parser() -> argparse.ArgumentParser:
   parser.add_argument('--no-test', action='store_true', help='Dont test packages after build.')
   parser.add_argument('--publish', default=NotImplemented, nargs='?', help='Publish built packages from the specified directory (or the same directory as --generate/--build)')
   parser.add_argument('--to', help='Publish built packages to the specified repository URL.')
+  parser.add_argument('--kick', action='store_true', help='Submit an empty commit to a feedstock repo to kick off the build process once more.')
   return parser
 
 
@@ -118,6 +119,7 @@ class Options:
     CREATE = enum.auto()
     UPDATE = enum.auto()
     BUILD_AND_STUFF = enum.auto()
+    KICK = enum.auto()
 
   token: t.Optional[str] = None
   branch: t.Optional[str] = None
@@ -141,7 +143,9 @@ class Options:
     self.build_channels = args.build_channel or []
     self.no_test = args.no_test
 
-    if sum(1 for _ in (args.list, args.create, args.update, args.generate) if _) > 1:
+    do_build = args.build is not NotImplemented
+    do_publish = args.publish is not NotImplemented
+    if sum(1 for _ in (args.list, args.create, args.update, (args.generate or do_build or do_publish), args.kick) if _) > 1:
       raise ValueError('multiple operations specified')
     if args.list:
       self.action = Options.Action.LIST
@@ -149,12 +153,14 @@ class Options:
       self.action = Options.Action.CREATE
     elif args.update:
       self.action = Options.Action.UPDATE
-    elif args.generate or args.build or args.publish:
+    elif args.generate or do_build or do_publish:
       self.generate_dir = args.generate
-      self.build_from_dir = None if args.build is NotImplemented else (args.build or self.generate_dir)
-      self.publish_from_dir = None if args.publish is NotImplemented else (args.publish or self.build_from_dir)
+      self.build_from_dir = (args.build or self.generate_dir) if do_build else None
+      self.publish_from_dir = (args.publish or self.build_from_dir) if do_publish else None
       self.publish_to = args.to
       self.action = Options.Action.BUILD_AND_STUFF
+    elif args.kick:
+      self.action = Options.Action.KICK
 
     return self
 
@@ -251,15 +257,24 @@ class FeedstocksManager:
     cb = repo.get_current_branch_name()
     repo.push('origin', f'{cb}:{cb}', force=True)
 
-  def update_feedstock(self, package: str, branch_name: t.Optional[str] = None) -> None:
-    version = self._get_package_versions()[package]
-    repo = nr.utils.git.Git(f'data/{package}-feedstock')
+  def _get_cloned_feedstock(self, package: str, upstream_only: bool = False) -> nr.utils.git.Git:
+    repo = nr.utils.git.Git(f'data/{package}-feedstock' + ('-upstream' if upstream_only else ''))
     clone_url = f'git@github.com:{self._config.github_user}/{package}-feedstock'
     upstream_url = f'https://github.com/conda-forge/{package}-feedstock'
-    if self._gh:
+    if self._gh and not upstream_only:
       self._ensure_fork_exists('conda-forge', f'{package}-feedstock')
-    self._ensure_repo_is_cloned(repo, clone_url, upstream_url, self._config.after_clone)
-    repo.fetch('upstream')
+    self._ensure_repo_is_cloned(
+      repo,
+      upstream_url if upstream_only else clone_url,
+      upstream_url,
+      self._config.after_clone)
+    if not upstream_only:
+      repo.fetch('upstream')
+    return repo
+
+  def update_feedstock(self, package: str, branch_name: t.Optional[str] = None) -> None:
+    version = self._get_package_versions()[package]
+    repo = self._get_cloned_feedstock(package)
 
     print(f'Creating upgrade PR for {package}@{version}')
     branch_name = branch_name or f'upgrade-to-{version}'
@@ -297,6 +312,16 @@ class FeedstocksManager:
         package_name = re.split(r'[\s<>=!]', item.value)[0]
         if package_name in packages:
           item.value = self._prefix + item.value
+
+  def kick_feedstocks(self, packages: t.List[str]) -> None:
+    for package in packages:
+      cprint(f'Kicking {package}..', 'magenta')
+      repo = self._get_cloned_feedstock(package, upstream_only=True)
+      repo.checkout('master')
+      repo.reset(hard=True)
+      repo.commit('Kick CI', allow_empty=True)
+      repo.push('origin')
+      print()
 
 
 def main():
@@ -376,6 +401,9 @@ def main():
           with file_.open('rb') as fp:
             url = posixpath.join(options.publish_to, channel.name, file_.name)
             requests.put(url, data=fp).raise_for_status()
+
+  elif options.action == Options.Action.KICK:
+    manager.kick_feedstocks(options.packages)
 
   else:
     parser.error('something unexpected happened')
