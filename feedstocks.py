@@ -35,6 +35,7 @@ STAGED_RECIPES_CLONE_URL_TEMPLATE = 'https://github.com/{user}/staged-recipes.gi
 class Config:
   github_user: str
   feedstocks: t.List[str]
+  deprecated: t.List[str] = dataclasses.field(default_factory=list)
   conda_bin: t.Optional[str] = None
   after_clone: t.Optional[str] = None
 
@@ -208,6 +209,21 @@ class FeedstocksManager:
 
   def get_unpublished_packages(self) -> t.List[str]:
     return [p for p in self._get_package_versions() if not get_feedstock_meta_yaml(p)]
+
+  def get_kickable_feedstocks(self) -> t.List[str]:
+    """
+    Finds those feedstocks for which the current version does not show up in Anaconda.
+    The lookup is performed on anaconda.org to find the latest up-to-date information,
+    as the repodata could be affected by CDN lags.
+    """
+
+    missing: t.List[str] = []
+    for package, version in self._get_package_versions().items():
+      url = f'https://anaconda.org/conda-forge/{package}/files'
+      html = requests.get(url).text
+      if f'{package}-{version}' not in html:
+        missing.append(package)
+    return missing
 
   def list_feedstock_status(self) -> None:
     package_versions = self._get_package_versions()
@@ -403,6 +419,9 @@ def main():
             requests.put(url, data=fp).raise_for_status()
 
   elif options.action == Options.Action.KICK:
+    if not options.packages:
+      options.packages = manager.get_kickable_feedstocks()
+    cprint(f'Kicking {len(options.packages)} package(s): {options.packages}')
     manager.kick_feedstocks(options.packages)
 
   else:

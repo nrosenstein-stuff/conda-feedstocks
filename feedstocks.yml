@@ -14,8 +14,7 @@ feedstocks:
 - nr.stream@0.1.2
 - nr.utils.re@0.3.1
 - pydoc-markdown@4.1.5
-
-# Deprecated packages
+deprecated:
 - nr@2.0.12
 - nr.bundler@1.2.2
 - nr.cli@1.2.1
