@@ -368,6 +368,7 @@ class FeedstocksManager:
       repo = self._get_cloned_feedstock(package, upstream_only=True)
       repo.checkout('master')
       repo.reset(hard=True)
+      repo.pull('origin', 'master')
       repo.commit('Kick CI', allow_empty=True)
       repo.push('origin')
       print()
