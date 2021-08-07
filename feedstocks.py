@@ -238,12 +238,14 @@ class FeedstocksManager:
 
     cprint('Collecting feedstocks that seem like they can be kicked...', 'cyan')
     cprint('  Fetching repodata.json.bz2...', 'cyan')
-    repodata = get_conda_forge_repodata('noarch')
+    packages = {}
+    packages.update(get_conda_forge_repodata('noarch')['packages'])
+    packages.update(get_conda_forge_repodata('linux-64')['packages'])
 
     def _repodata_package_file(name: str) -> t.List[str]:
       result: t.List[str] = []
-      for filename, info in repodata['packages'].items():
-        if info['name'] == name:
+      for filename, info in packages.items():
+        if info['name'].lower() == name.lower():
           result.append(filename)
       return result
 
@@ -263,12 +265,15 @@ class FeedstocksManager:
         cprint(f'  Skipping {package} (exists)', 'green')
         continue
       recipe = parse_meta_yaml(meta_yaml)
-      requirements = Stream(recipe['requirements'].values()).concat().map(get_package_name_from_version_selector).collect()
+      requirements = Stream(recipe['requirements'].values()).concat().map(get_package_name_from_version_selector).collect(set)
+      requirements.discard('python')
       missing[package] = requirements
 
     # Remove packages that depend on other kickable packages.
     skip: t.Set[str] = set()
     for package, requirements in missing.items():
+      if 'python' in requirements:
+        requirements.remove('python')
       depends_on_kickables = [p for p in requirements if p in missing]
       if depends_on_kickables:
         cprint(f'  Skipping {package} (depends on another kickable package(s): {depends_on_kickables})', 'magenta')
