@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 
 import argparse
-import enum
+import bz2
 import dataclasses
+import enum
+import io
+import json
 import os
 import posixpath
 import re
@@ -42,6 +45,12 @@ class Config:
 
   def get_conda_bin(self) -> str:
     return os.path.expanduser(self.conda_bin) if self.conda_bin else 'conda'
+
+
+def get_conda_forge_repodata(channel: str) -> t.Dict[str, t.Any]:
+  response = requests.get(f'https://conda.anaconda.org/conda-forge/{channel}/repodata.json.bz2', stream=True)
+  response.raise_for_status()
+  return json.loads(bz2.decompress(response.content).decode())
 
 
 def get_feedstock_meta_yaml(package_name: str) -> t.Optional[str]:
@@ -226,7 +235,17 @@ class FeedstocksManager:
     as the repodata could be affected by CDN lags.
     """
 
+
     cprint('Collecting feedstocks that seem like they can be kicked...', 'cyan')
+    cprint('  Fetching repodata.json.bz2...', 'cyan')
+    repodata = get_conda_forge_repodata('noarch')
+
+    def _repodata_package_file(name: str) -> t.List[str]:
+      result: t.List[str] = []
+      for filename, info in repodata['packages'].items():
+        if info['name'] == name:
+          result.append(filename)
+      return result
 
     missing: t.Dict[str, t.Set[str]] = {}
     for package, version in self._get_package_versions().items():
@@ -253,6 +272,11 @@ class FeedstocksManager:
       depends_on_kickables = [p for p in requirements if p in missing]
       if depends_on_kickables:
         cprint(f'  Skipping {package} (depends on another kickable package(s): {depends_on_kickables})', 'magenta')
+        skip.add(package)
+        continue
+      depends_on_cdn_delayed_packages = [p for p in requirements if not _repodata_package_file(p)]
+      if depends_on_cdn_delayed_packages:
+        cprint(f'  Skipping {package} (depends on package(s) delayed by CDN: {depends_on_cdn_delayed_packages})', 'magenta')
         skip.add(package)
         continue
 
