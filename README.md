@@ -7,6 +7,7 @@ __Requirements__
 * Git
 * GitHub Token (to automatically create forks if needed)
 * Conda-Smithy (`conda install -c conda-forge conda-smithy`)
+  * May need to install `libarchive-tools` on Ubuntu for `bsdtar`
 * Conda-Build (`conda install conda-build`)
 * Python 3.8 or newer
 
