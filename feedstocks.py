@@ -47,6 +47,19 @@ class Config:
     return os.path.expanduser(self.conda_bin) if self.conda_bin else 'conda'
 
 
+def get_latest_conda_smithy_version() -> str:
+  request = requests.get('https://api.anaconda.org/package/conda-forge/conda-smithy')
+  request.raise_for_status()
+  return request.json()['latest_version']
+
+
+def get_latest_pypi_version(package: str) -> t.Optional[str]:
+  response = requests.get(f'https://pypi.org/pypi/{package}/json')
+  response.raise_for_status()
+  data = response.json()
+  return data['info']['version']
+
+
 def get_conda_forge_repodata(channel: str) -> t.Dict[str, t.Any]:
   response = requests.get(f'https://conda.anaconda.org/conda-forge/{channel}/repodata.json.bz2', stream=True)
   response.raise_for_status()
@@ -290,13 +303,15 @@ class FeedstocksManager:
   def list_feedstock_status(self) -> None:
     package_versions = self._get_package_versions()
     for package, target_version in package_versions.items():
+      pypi_version = get_latest_pypi_version(package)
       meta_yaml = get_feedstock_meta_yaml(package)
+      color = 'green' if (pypi_version == target_version and latest_version == target_version) else 'yellow'
       if meta_yaml:
         latest_version = get_version_from_meta_yaml(meta_yaml)
         if latest_version == target_version:
-          cprint(f'{package} {target_version}', 'green')
+          cprint(f'{package} {target_version} (on pypi: {pypi_version})', color)
         else:
-          cprint(f'{package} {latest_version} (expected {target_version})', 'yellow')
+          cprint(f'{package} {latest_version} (expected {target_version}) (on pypi: {pypi_version})', color)
       else:
         cprint(f'{package} not found', 'red')
 
@@ -351,6 +366,14 @@ class FeedstocksManager:
     return repo
 
   def update_feedstock(self, package: str, branch_name: t.Optional[str] = None) -> None:
+    conda = self._config.get_conda_bin()
+    conda_smithy_version = subprocess.check_output([conda, 'smithy', '--version']).decode().strip()
+    latest_version = get_latest_conda_smithy_version()
+    if conda_smithy_version != latest_version:
+      print(f'You have conda-smithy {conda_smithy_version} installed, but the latest version is {latest_version}.')
+      print(f'Upgrading conda-smithy to the latest version {latest_version}...')
+      subprocess.check_call([conda, 'install', '-c', 'conda-forge', 'conda-smithy==' + latest_version, '--yes'])
+
     version = self._get_package_versions()[package]
     repo = self._get_cloned_feedstock(package)
 
@@ -362,7 +385,7 @@ class FeedstocksManager:
     output_dir = os.path.join(repo.path, 'recipe')
     generate_recipe_into(output_dir, package, version, self._process_recipe)
 
-    subprocess.check_call([self._config.get_conda_bin(), 'smithy', 'rerender'], cwd=repo.path)
+    subprocess.check_call([conda, 'smithy', 'rerender'], cwd=repo.path)
 
     repo.add([os.path.relpath(output_dir, repo.path)])
     repo.commit(f"{package}@{version} (grayskull {grayskull_version})")

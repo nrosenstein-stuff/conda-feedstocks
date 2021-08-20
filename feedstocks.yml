@@ -3,7 +3,7 @@ github_user: NiklasRosenstein
 conda_bin: ~/miniconda3/bin/conda
 feedstocks:
 - databind.core@1.1.4
-- databind.json@1.1.4
+- databind.json@1.1.5
 - docspec@1.0.1
 - docspec-python@1.0.1
 - nr.fs@1.6.3
