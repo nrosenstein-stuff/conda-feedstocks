@@ -305,9 +305,9 @@ class FeedstocksManager:
     for package, target_version in package_versions.items():
       pypi_version = get_latest_pypi_version(package)
       meta_yaml = get_feedstock_meta_yaml(package)
-      color = 'green' if (pypi_version == target_version and latest_version == target_version) else 'yellow'
       if meta_yaml:
         latest_version = get_version_from_meta_yaml(meta_yaml)
+        color = 'green' if (pypi_version == target_version and latest_version == target_version) else 'yellow'
         if latest_version == target_version:
           cprint(f'{package} {target_version} (on pypi: {pypi_version})', color)
         else:
