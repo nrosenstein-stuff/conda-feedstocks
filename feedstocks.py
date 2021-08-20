@@ -353,7 +353,7 @@ class FeedstocksManager:
   def _get_cloned_feedstock(self, package: str, upstream_only: bool = False) -> nr.utils.git.Git:
     repo = nr.utils.git.Git(f'data/{package}-feedstock' + ('-upstream' if upstream_only else ''))
     clone_url = f'git@github.com:{self._config.github_user}/{package}-feedstock'
-    upstream_url = f'https://github.com/conda-forge/{package}-feedstock'
+    upstream_url = f'git@github.com:conda-forge/{package}-feedstock.git'
     if self._gh and not upstream_only:
       self._ensure_fork_exists('conda-forge', f'{package}-feedstock')
     self._ensure_repo_is_cloned(
